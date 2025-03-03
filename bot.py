@@ -12,6 +12,8 @@ import asyncio
 import random
 import string
 from config import Config
+from typing import Union
+
 
 # Настройка логирования
 logging.basicConfig(
@@ -133,6 +135,14 @@ def get_stats_type_keyboard():
     )
     return keyboard
 
+# Добавить в раздел с клавиатурами -- клавиатура пропуска комментария после ввода суммы
+def get_skip_comment_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]
+        ]
+    )
+
 # Функция для экранирования специальных символов
 def escape_markdown(text):
     # Экранируем символы, которые могут нарушать форматирование Markdown
@@ -144,7 +154,8 @@ def get_user_sheet(user_id):
         return spreadsheet.worksheet(str(user_id))
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=str(user_id), rows=100, cols=10)
-        worksheet.append_row(["Дата", "Категория", "Сумма", "Теги", "Тип"])
+        # Добавлена колонка "Комментарий"
+        worksheet.append_row(["Дата", "Категория", "Сумма", "Теги", "Тип", "Комментарий"])
         return worksheet
 
 def get_family_sheet(family_id):
@@ -286,88 +297,90 @@ async def handle_amount(message: Message):
 async def handle_expense_type(query: CallbackQuery):
     user_id = query.from_user.id
     expense_type = query.data
-    amount = user_data.get(user_id, {}).get("amount", 0)
+    user_data[user_id] = {
+        "category": user_data.get(user_id, {}).get("category"),
+        "amount": user_data.get(user_id, {}).get("amount"),
+        "expense_type": expense_type,
+        "awaiting_comment": True  # Флаг ожидания комментария
+    }
+    
+    await query.message.answer(
+        "Введите комментарий к трате:",
+        reply_markup=get_skip_comment_keyboard()  # Кнопка "Пропустить"
+    )
+    await query.answer()
+
+@dp.callback_query(lambda query: query.data == "skip_comment")
+async def handle_skip_comment(query: CallbackQuery):
+    user_id = query.from_user.id
+    user_data[user_id]["comment"] = ""  # Пустой комментарий
+    await process_expense(user_id, query.message)
+    await query.answer()
+
+@dp.message(lambda message: user_data.get(message.from_user.id, {}).get("awaiting_comment"))
+async def handle_comment(message: Message):
+    user_id = message.from_user.id
+    user_data[user_id]["comment"] = message.text.strip()
+    await process_expense(user_id, message)
+
+async def process_expense(user_id: int, message: Union[Message, CallbackQuery]):
+    data = user_data.get(user_id, {})
+    comment = data.get("comment", "")
     
     try:
-        # Получаем категорию из временных данных пользователя
-        category = user_data.get(user_id, {}).get("category", "💼 Прочее")  # Используем сохраненную категорию
-        
-        if expense_type == "personal":
-            # Личная трата: сохраняем в личный лист пользователя
+        if data["expense_type"] == "personal":
             sheet = get_user_sheet(user_id)
             row = [
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                category,  # Используем сохраненную категорию
-                amount,
-                "",  # Теги можно добавить позже
-                "Личная"  # Тип траты
+                data["category"],
+                data["amount"],
+                "",  # Теги
+                "Личная",
+                comment  # Комментарий
             ]
             sheet.append_row(row)
-            logger.info(f"Личная трата добавлена: пользователь {user_id}, категория {category}, сумма {amount}")
-            await query.message.answer(
-                f"✅ Личная трата: {category} - {amount} руб. добавлена!",
-                reply_markup=get_main_menu(),
-                parse_mode=None  # Отключаем форматирование Markdown
-            )
-        
-        elif expense_type == "family":
-            # Семейная трата: сохраняем в лист семьи
-            families_list = setup_families_list()
-            records = families_list.get_all_records()
-            family_id = None
             
-            # Ищем family_id, в которой состоит пользователь
-            for record in records:
-                if str(user_id) == str(record.get("user_id")):
-                    family_id = record.get("family_id")
-                    break
+        elif data["expense_type"] == "family":
+            families_list = setup_families_list()
+            family_id = next(
+                (r["family_id"] for r in families_list.get_all_records() 
+                if str(user_id) == str(r["user_id"])), None
+            )
             
             if family_id:
-                # Получаем лист семьи
+                logger.info(f"Найдена семья: {family_id}")  # <--- Логируем family_id
                 family_sheet = get_family_sheet(f"family-{family_id}")
                 if family_sheet:
+                    logger.info(f"Лист семьи найден: {family_sheet.title}") 
                     row = [
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        category,  # Используем сохраненную категорию
-                        amount,
-                        "",  # Теги можно добавить позже
-                        str(user_id),  # user_id пользователя, который внес трату
-                        "Семейная"  # Тип траты
+                        data["category"],
+                        data["amount"],
+                        "",  # Теги
+                        "Семейная",
+                        str(user_id),
+                        comment  # Комментарий
                     ]
                     family_sheet.append_row(row)
-                    logger.info(f"Семейная трата добавлена: пользователь {user_id}, категория {category}, сумма {amount}")
-                    await query.message.answer(
-                        f"✅ Семейная трата: {category} - {amount} руб. добавлена!",
-                        reply_markup=get_main_menu(),
-                        parse_mode=None  # Отключаем форматирование Markdown
-                    )
                 else:
-                    logger.error(f"Лист семьи {family_id} не найден")
-                    await query.message.answer(
-                        "❌ Произошла ошибка при записи траты. Пожалуйста, попробуйте позже.",
-                        reply_markup=get_main_menu(),
-                        parse_mode=None  # Отключаем форматирование Markdown
-                    )
+                    logger.error("Лист семьи не найден!")  # <--- Ошибка
             else:
-                logger.warning(f"Пользователь {user_id} не состоит в семье, но попытался добавить семейную трату")
-                await query.message.answer(
-                    "❌ Вы не состоите в семье. Невозможно добавить семейную трату.",
-                    reply_markup=get_main_menu(),
-                    parse_mode=None  # Отключаем форматирование Markdown
-                )
+                logger.warning("Пользователь не состоит в семье!")  # <--- Предупреждение
         
-        # Очищаем временные данные пользователя
-        user_data.pop(user_id, None)
-    
-    except Exception as e:
-        logger.error(f"Ошибка при записи траты: {e}")
-        await query.message.answer(
-            "❌ Произошла ошибка при записи траты. Пожалуйста, попробуйте позже.",
-            reply_markup=get_main_menu(),
-            parse_mode=None  # Отключаем форматирование Markdown
+        # Очистка данных и возврат в меню
+        del user_data[user_id]
+        #print(data)
+        category_p = data["category"]
+        amount_p = data["amount"]
+        expense_type_p = data["expense_type"]
+        await message.answer(
+            f"✅ Трата сохранена! Категория: {category_p} Сумма: {amount_p} Тип: {expense_type_p} Комментарий: {comment if comment else 'нет'}",
+            reply_markup=get_main_menu()
         )
-    
-    await query.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+        await message.answer("❌ Ошибка, попробуйте снова", reply_markup=get_main_menu())
 
 @dp.message(lambda message: message.text == "Посмотреть статистику")
 async def show_stats_menu(message: Message):
