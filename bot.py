@@ -5,6 +5,9 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 import re
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -13,7 +16,7 @@ import random
 import string
 from config import Config
 from typing import Union
-
+import uuid
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,7 +43,7 @@ bot = Bot(
     token=Config.BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)  # Указываем parse_mode здесь
 )
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 # Словарь для хранения временных данных пользователя
 user_data = {}
@@ -66,12 +69,18 @@ CATEGORIES = [
     "💼 Прочее"
 ]
 
+# Класс для хранения состояний
+class EditExpense(StatesGroup):
+    SELECT_FIELD = State()
+    ENTER_NEW_VALUE = State()
+
 # Главное меню
 def get_main_menu():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Записать расход")],
             [KeyboardButton(text="Посмотреть статистику")],
+            [KeyboardButton(text="Последние траты")],  # Новая кнопка
             [KeyboardButton(text="Создать семью"), KeyboardButton(text="Вступить в семью")]
         ],
         resize_keyboard=True  # Клавиатура подстраивается под размер экрана
@@ -143,6 +152,26 @@ def get_skip_comment_keyboard():
         ]
     )
 
+# Добавить в раздел клавиатур -- клавиатура редактирования траты
+def get_expense_actions_keyboard(expense_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{expense_id}")#,
+                #InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{expense_id}")
+            ]
+        ]
+    )
+
+def get_edit_fields_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Категория", callback_data="category")],
+            [InlineKeyboardButton(text="Сумма", callback_data="amount")],
+            [InlineKeyboardButton(text="Комментарий", callback_data="comment")]
+        ]
+    )
+
 # Функция для экранирования специальных символов
 def escape_markdown(text):
     # Экранируем символы, которые могут нарушать форматирование Markdown
@@ -151,16 +180,22 @@ def escape_markdown(text):
 
 def get_user_sheet(user_id):
     try:
-        return spreadsheet.worksheet(str(user_id))
+        sheet = spreadsheet.worksheet(str(user_id))
+        # Проверяем наличие колонки ID
+        if sheet.row_values(1)[0] != "ID":
+            sheet.insert_cols([{"values": ["ID"]}], 1)  # Добавляем колонку ID в начало
+        return sheet
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=str(user_id), rows=100, cols=10)
-        # Добавлена колонка "Комментарий"
-        worksheet.append_row(["Дата", "Категория", "Сумма", "Теги", "Тип", "Комментарий"])
-        return worksheet
+        sheet = spreadsheet.add_worksheet(title=str(user_id), rows=100, cols=11)
+        sheet.append_row(["ID", "Дата", "Категория", "Сумма", "Теги", "Тип", "Комментарий"])
+        return sheet
 
 def get_family_sheet(family_id):
     try:
-        return spreadsheet.worksheet(family_id)
+        sheet = spreadsheet.worksheet(family_id)
+        if sheet.row_values(1)[0] != "ID":
+            sheet.insert_cols([{"values": ["ID"]}], 1)
+        return sheet
     except gspread.WorksheetNotFound:
         return None
 
@@ -326,11 +361,13 @@ async def handle_comment(message: Message):
 async def process_expense(user_id: int, message: Union[Message, CallbackQuery]):
     data = user_data.get(user_id, {})
     comment = data.get("comment", "")
+    expense_id = str(uuid.uuid4())  # Генерируем UUID
     
     try:
         if data["expense_type"] == "personal":
             sheet = get_user_sheet(user_id)
             row = [
+                expense_id,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 data["category"],
                 data["amount"],
@@ -353,6 +390,7 @@ async def process_expense(user_id: int, message: Union[Message, CallbackQuery]):
                 if family_sheet:
                     logger.info(f"Лист семьи найден: {family_sheet.title}") 
                     row = [
+                        expense_id,
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         data["category"],
                         data["amount"],
@@ -504,6 +542,167 @@ async def handle_stats_type(query: CallbackQuery):
         await query.message.answer("❌ Произошла ошибка при расчете статистики. Пожалуйста, попробуйте позже.", reply_markup=get_main_menu())
     
     await query.answer()
+
+# Обновленная функция для получения последних трат
+async def get_last_expenses(user_id: int, limit: int = 5):
+    expenses = []
+    seen_ids = set()  # Множество для отслеживания уникальных ID
+
+    # Личные траты
+    personal_sheet = get_user_sheet(user_id)
+    personal_records = personal_sheet.get_all_records()
+    for record in personal_records:
+        if record["ID"] not in seen_ids:
+            seen_ids.add(record["ID"])
+            expenses.append({
+                "id": record["ID"],
+                "type": "personal",
+                "data": record
+            })
+
+    # Семейные траты
+    families_list = setup_families_list()
+    user_families = {r["family_id"] for r in families_list.get_all_records() if str(r["user_id"]) == str(user_id)}
+    
+    for family_id in user_families:
+        family_sheet = get_family_sheet(f"family-{family_id}")
+        if family_sheet:
+            family_records = family_sheet.get_all_records()
+            for record in family_records:
+                if record["ID"] not in seen_ids:
+                    seen_ids.add(record["ID"])
+                    expenses.append({
+                        "id": record["ID"],
+                        "type": "family",
+                        "data": record
+                    })
+
+    # Сортировка и ограничение
+    expenses.sort(
+        key=lambda x: datetime.strptime(x["data"]["Дата"], "%Y-%m-%d %H:%M:%S"),
+        reverse=True
+    )
+    return expenses[:limit]
+
+# Обновленный обработчик последних трат
+@dp.message(lambda message: message.text == "Последние траты")
+async def show_last_expenses(message: Message):
+    user_id = message.from_user.id
+    expenses = await get_last_expenses(user_id)
+    
+    if not expenses:
+        await message.answer("📭 У вас пока нет записанных трат.")
+        return
+    
+    for expense in expenses:
+        emoji = "👤" if expense["type"] == "personal" else "👨👩👧👦"
+        text = (
+            f"{emoji} *{'Личная' if expense['type'] == 'personal' else 'Семейная'} трата*\n"
+            f"🗓 {expense['data']['Дата']}\n"
+            f"🏷 {expense['data']['Категория']}\n"
+            f"💵 {expense['data']['Сумма']} руб.\n"
+            f"📝 {expense['data'].get('Комментарий', 'нет комментария')}"
+        )
+        
+        callback_data = f"delete_{expense['id']}"
+        
+        await message.answer(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(
+                    text="❌ Удалить", 
+                    callback_data=callback_data
+                )]]
+            ),
+            parse_mode="Markdown"
+        )
+
+# Обновленный обработчик удаления
+@dp.callback_query(lambda query: query.data.startswith("delete_"))
+async def handle_delete_expense(query: CallbackQuery):
+    try:
+        expense_id = query.data.split("_")[1]
+        
+        # Ищем трату во всех листах пользователя
+        user_id = query.from_user.id
+        
+        # 1. Проверяем личные траты
+        personal_sheet = get_user_sheet(user_id)
+        cell = personal_sheet.find(expense_id)
+        if cell:
+            personal_sheet.delete_rows(cell.row)
+            await query.message.edit_text("✅ Личная трата удалена!")
+            return
+        
+        # 2. Проверяем семейные траты
+        families_list = setup_families_list()
+        user_families = [
+            r["family_id"] for r in families_list.get_all_records() 
+            if str(r["user_id"]) == str(user_id)
+        ]
+        
+        for family_id in user_families:
+            family_sheet = get_family_sheet(f"family-{family_id}")
+            if not family_sheet:
+                continue
+            cell = family_sheet.find(expense_id)
+            if cell:
+                family_sheet.delete_rows(cell.row)
+                await query.message.edit_text("✅ Семейная трата удалена!")
+                return
+        
+        # Если не найдено
+        await query.answer("❌ Трата не найдена")
+    
+    except Exception as e:
+        logger.error(f"Ошибка удаления: {e}")
+        await query.answer("❌ Ошибка при удалении")
+
+# Обработчик редактирования
+@dp.callback_query(lambda query: query.data.startswith("edit_"), EditExpense.SELECT_FIELD)
+async def handle_edit_expense(query: CallbackQuery, state: FSMContext):
+    expense_id = query.data.split("_")[1]
+    await state.update_data(expense_id=expense_id)
+    
+    await query.message.answer(
+        "Выберите поле для редактирования:",
+        reply_markup=get_edit_fields_keyboard()
+    )
+    await state.set_state(EditExpense.SELECT_FIELD)
+    await query.answer()
+
+# Обработчик выбора поля
+@dp.callback_query(EditExpense.SELECT_FIELD)
+async def handle_select_field(query: CallbackQuery, state: FSMContext):
+    field = query.data
+    await state.update_data(field=field)
+    await query.message.answer("Введите новое значение:")
+    await state.set_state(EditExpense.ENTER_NEW_VALUE)
+    await query.answer()
+
+# Обработчик ввода нового значения
+@dp.message(EditExpense.ENTER_NEW_VALUE)
+async def handle_new_value(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    
+    try:
+        sheet = get_user_sheet(user_id)
+        row = int(data['expense_id'])
+        col = {
+            "category": 2,  # B столбец
+            "amount": 3,    # C столбец
+            "comment": 6     # F столбец
+        }[data['field']]
+        
+        # Обновляем ячейку
+        sheet.update_cell(row, col, message.text)
+        await message.answer("✅ Трата обновлена!")
+    except Exception as e:
+        logger.error(f"Ошибка редактирования: {e}")
+        await message.answer("❌ Не удалось обновить трату")
+    
+    await state.clear()
 
 @dp.message()
 async def handle_unknown(message: Message):
