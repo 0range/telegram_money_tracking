@@ -17,6 +17,7 @@ import string
 from config import Config
 from typing import Union
 import uuid
+import pytz
 
 # Настройка логирования
 logging.basicConfig(
@@ -710,49 +711,82 @@ async def handle_unknown(message: Message):
 
 # Функция для отправки ежедневного напоминания
 async def send_daily_reminder(bot: Bot):
+    msk = pytz.timezone('Europe/Moscow')  # Московский часовой пояс
+    
     while True:
-        now = datetime.now()
-        target_time = now.replace(hour=21, minute=0, second=0, microsecond=0)  # 21:00 МСК
+        now = datetime.now(msk)  # Текущее время в МСК
+        target_time = now.replace(hour=21, minute=0, second=0, microsecond=0, tzinfo=msk)
+        
+        # Если текущее время позже целевого, переносим на завтра
         if now > target_time:
-            target_time += timedelta(days=1)  # На следующий день
-        time_to_wait = (target_time - now).total_seconds()
-        await asyncio.sleep(time_to_wait)
-
-        # Проверяем, были ли сегодня траты
+            target_time += timedelta(days=1)
+        
+        # Ждем до целевого времени
+        wait_seconds = (target_time - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        
+        # Текущая дата в МСК
+        today = now.strftime("%Y-%m-%d")
+        
+        # Проверяем все листы
         for worksheet in spreadsheet.worksheets():
-            if worksheet.title.startswith('family-'):
-                # Пропускаем листы семьи, так как напоминания отправляются только для личных трат
+            # Пропускаем семейные и нечисловые листы
+            if worksheet.title.startswith('family-') or not worksheet.title.isdigit():
                 continue
             
-            user_id = worksheet.title
-            records = worksheet.get_all_records()
-            today = datetime.now().strftime("%Y-%m-%d")
-            today_expenses = [record for record in records if record["Дата"].startswith(today)]
-
-            if not today_expenses:
-                try:
+            try:
+                user_id = int(worksheet.title)
+                records = worksheet.get_all_records()
+                
+                # Пропускаем пустые листы или без колонки "Дата"
+                if not records or "Дата" not in records[0]:
+                    continue
+                
+                # Ищем сегодняшние траты
+                today_expenses = [
+                    record for record in records 
+                    if record.get("Дата", "").startswith(today)
+                ]
+                
+                # Отправляем уведомление, если трат нет
+                if not today_expenses:
                     await bot.send_message(
-                        chat_id=int(user_id),
+                        chat_id=user_id,
                         text="Неужели ничего не потратили? Давайте вспомним и запишем основные категории.",
                         reply_markup=get_categories_keyboard()
                     )
-                except Exception as e:
-                    logger.error(f"Ошибка при отправке ежедневного напоминания пользователю {user_id}: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Ошибка у пользователя {worksheet.title}: {str(e)}")
 
 # Функция для отправки еженедельного напоминания
 async def send_weekly_reminder(bot: Bot):
+    msk = pytz.timezone('Europe/Moscow')  # Часовой пояс Москвы
+    
     while True:
-        now = datetime.now()
-        target_time = now.replace(hour=11, minute=0, second=0, microsecond=0)  # 11:00 МСК
-        if now > target_time:
-            target_time += timedelta(days=(7 - now.weekday()))  # Следующее воскресенье
-        time_to_wait = (target_time - now).total_seconds()
-        await asyncio.sleep(time_to_wait)
-
-        # Отправляем напоминание
+        now = datetime.now(msk)  # Текущее время в МСК
+        target_time = now.replace(hour=11, minute=0, second=0, microsecond=0, tzinfo=msk)
+        
+        # Вычисляем дни до следующего воскресенья
+        days_until_sunday = (6 - now.weekday()) % 7  # 6 - воскресенье в Python
+        
+        # Если сегодня воскресенье и время уже прошло:
+        if days_until_sunday == 0 and now > target_time:
+            days_until_sunday = 7  # Ждем следующее воскресенье
+        
+        target_time += timedelta(days=days_until_sunday)
+        
+        # Если target_time всё равно в прошлом (например, из-за перехода на летнее время)
+        if target_time < now:
+            target_time += timedelta(days=7)
+        
+        # Ждем до целевого времени
+        wait_seconds = (target_time - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        
+        # Отправка уведомлений...
         for worksheet in spreadsheet.worksheets():
             if worksheet.title.startswith('family-'):
-                # Пропускаем листы семьи, так как напоминания отправляются только для личных трат
                 continue
             
             user_id = worksheet.title
@@ -763,7 +797,7 @@ async def send_weekly_reminder(bot: Bot):
                     reply_markup=get_main_menu()
                 )
             except Exception as e:
-                logger.error(f"Ошибка при отправке еженедельного напоминания пользователю {user_id}: {e}")
+                logger.error(f"Ошибка отправки: {user_id} - {e}")
 
 # Запуск планировщика
 async def scheduler(bot: Bot):
