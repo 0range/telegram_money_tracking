@@ -326,7 +326,7 @@ async def handle_family_id(message: Message):
 @dp.message(lambda message: message.text == "Записать расход")
 async def start_add_expense(message: Message, state: FSMContext):
     await state.clear()  # Очищаем все состояния
-    user_data[user_id] = {}  # Сбрасываем временные данные
+    #user_data[user_id] = {}  # Сбрасываем временные данные
     await message.reply(
         "Выберите категорию:",
         reply_markup=get_categories_keyboard()
@@ -840,8 +840,13 @@ async def show_user_budgets(query: CallbackQuery):
         return
     
     text = "Ваши текущие бюджеты:\n\n"
+    total_money = 0
     for budget in user_budgets:
         text += f"{budget['category']}: {budget['budget']} руб/мес\n"
+        total_money += int(budget['budget'])
+
+    text += f"\n"
+    text += f"Итого: {total_money} руб/мес"
     
     await query.message.answer(text)
     await query.answer()
