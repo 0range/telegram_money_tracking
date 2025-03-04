@@ -18,6 +18,7 @@ from config import Config
 from typing import Union
 import uuid
 import pytz
+from collections import defaultdict
 
 # Настройка логирования
 logging.basicConfig(
@@ -74,6 +75,10 @@ CATEGORIES = [
 class EditExpense(StatesGroup):
     SELECT_FIELD = State()
     ENTER_NEW_VALUE = State()
+
+# Добавляем состояния статистики
+class StatsPeriod(StatesGroup):
+    WAITING_PERIOD = State()
 
 # Главное меню
 def get_main_menu():
@@ -135,15 +140,24 @@ def get_expense_type_keyboard():
     return keyboard
 
 # Inline-клавиатура для выбора типа статистики
+# Обновляем клавиатуру выбора типа статистики
 def get_stats_type_keyboard():
-    keyboard = InlineKeyboardMarkup(
+    return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Личная", callback_data="personal_stats")],
-            [InlineKeyboardButton(text="Семейная", callback_data="family_stats")],
-            [InlineKeyboardButton(text="Вся моя", callback_data="all_stats")]
+            [InlineKeyboardButton(text="Личная статистика", callback_data="stats_personal")],
+            [InlineKeyboardButton(text="Семейная статистика", callback_data="stats_family")],
+            [InlineKeyboardButton(text="Вся", callback_data="stats_all")]
         ]
     )
-    return keyboard
+
+# Клавиатура выбора периода
+def get_period_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="За неделю", callback_data="week")],
+            [InlineKeyboardButton(text="За месяц", callback_data="month")]
+        ]
+    )
 
 # Добавить в раздел с клавиатурами -- клавиатура пропуска комментария после ввода суммы
 def get_skip_comment_keyboard():
@@ -307,7 +321,7 @@ async def handle_category(query: CallbackQuery):
     )
 
     # Логи
-    print(user_data)
+    #print(user_data)
     
     # Подтверждаем обработку callback
     await query.answer()
@@ -321,7 +335,7 @@ async def handle_amount(message: Message):
     user_data[user_id]["amount"] = amount
     
     # Логи
-    print(user_data)
+    #print(user_data)
 
     # Запрашиваем тип траты
     await message.reply(
@@ -428,120 +442,87 @@ async def show_stats_menu(message: Message):
         reply_markup=get_stats_type_keyboard()
     )
 
-@dp.callback_query(lambda query: query.data in ["personal_stats", "family_stats", "all_stats"])
-async def handle_stats_type(query: CallbackQuery):
+# Общая функция расчета статистики
+async def calculate_stats(user_id: int, stats_type: str, start_date: datetime.date, end_date: datetime.date):
+    stats = defaultdict(float)
+    
+    # Личные траты
+    if stats_type in ["stats_personal", "stats_all"]:
+        personal_sheet = get_user_sheet(user_id)
+        records = personal_sheet.get_all_records()
+        for record in records:
+            record_date = datetime.strptime(record["Дата"], "%Y-%m-%d %H:%M:%S").date()
+            if start_date <= record_date <= end_date:
+                stats[record["Категория"]] += float(record["Сумма"])
+    
+    # Семейные траты
+    if stats_type in ["stats_family", "stats_all"]:
+        families_list = setup_families_list()
+        for family in filter(lambda r: str(user_id) == str(r["user_id"]), families_list.get_all_records()):
+            family_sheet = get_family_sheet(f"family-{family['family_id']}")
+            if family_sheet:
+                records = family_sheet.get_all_records()
+                for record in records:
+                    record_date = datetime.strptime(record["Дата"], "%Y-%m-%d %H:%M:%S").date()
+                    if start_date <= record_date <= end_date:
+                        stats[record["Категория"]] += float(record["Сумма"])
+    
+    return stats
+
+# Обработчик выбора типа статистики
+@dp.callback_query(lambda query: query.data in ["stats_personal", "stats_family", "stats_all"])
+async def handle_stats_type(query: CallbackQuery, state: FSMContext):
+    await state.update_data(stats_type=query.data)
+    await query.message.answer(
+        "Выберите период:",
+        reply_markup=get_period_keyboard()
+    )
+    await state.set_state(StatsPeriod.WAITING_PERIOD)
+    await query.answer()
+
+# Обработчик выбора периода
+@dp.callback_query(StatsPeriod.WAITING_PERIOD, lambda query: query.data in ["week", "month"])
+async def handle_stats_period(query: CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    stats_type = query.data
-    
-    # Получаем текущий месяц
-    current_month = datetime.now().strftime("%Y-%m")
-    
-    # Словарь для хранения статистики
-    stats = {}
-    total = 0
-    
+    data = await state.get_data()
+    stats_type = data["stats_type"]
+    period = query.data
+
     try:
-        if stats_type == "personal_stats":
-            # Личная статистика: только личные траты пользователя
-            sheet = get_user_sheet(user_id)
-            records = sheet.get_all_records()
-            monthly_expenses = [record for record in records if record["Дата"].startswith(current_month) and record.get("Тип") == "Личная"]
-            
-            for record in monthly_expenses:
-                category = record["Категория"]
-                amount = float(record["Сумма"])
-                stats[category] = stats.get(category, 0) + amount
-                total += amount
+        # Определяем даты периода
+        today = datetime.now(pytz.timezone('Europe/Moscow')).date()
         
-        elif stats_type == "family_stats":
-            # Семейная статистика: только общие траты семьи
-            families_list = setup_families_list()
-            records = families_list.get_all_records()
-            family_id = None
-            
-            # Логируем все записи из families_list для отладки
-            logger.info(f"Записи в families_list: {records}")
-            
-            # Ищем family_id, в которой состоит пользователь
-            for record in records:
-                if str(user_id) == str(record.get("user_id")):
-                    family_id = record.get("family_id")
-                    break
-            
-            if family_id:
-                # Получаем лист семьи
-                family_sheet = get_family_sheet(f"family-{family_id}")
-                if family_sheet:
-                    records = family_sheet.get_all_records()
-                    monthly_expenses = [record for record in records if record["Дата"].startswith(current_month)]
-                    
-                    for record in monthly_expenses:
-                        category = record["Категория"]
-                        amount = float(record["Сумма"])
-                        stats[category] = stats.get(category, 0) + amount
-                        total += amount
-                else:
-                    logger.error(f"Лист семьи {family_id} не найден")
-                    await query.message.answer("❌ Произошла ошибка при расчете статистики. Пожалуйста, попробуйте позже.", reply_markup=get_main_menu())
-                    return
-            else:
-                logger.warning(f"Пользователь {user_id} не состоит в семье, но запросил семейную статистику")
-                await query.message.answer("❌ Вы не состоите в семье. Невозможно показать семейную статистику.", reply_markup=get_main_menu())
-                return
-        
-        elif stats_type == "all_stats":
-            # Вся моя статистика: личные + общие траты
-            # Личные траты
-            sheet = get_user_sheet(user_id)
-            records = sheet.get_all_records()
-            monthly_expenses = [record for record in records if record["Дата"].startswith(current_month) and record.get("Тип") == "Личная"]
-            
-            for record in monthly_expenses:
-                category = record["Категория"]
-                amount = float(record["Сумма"])
-                stats[category] = stats.get(category, 0) + amount
-                total += amount
-            
-            # Общие траты
-            families_list = setup_families_list()
-            records = families_list.get_all_records()
-            family_id = None
-            
-            # Ищем family_id, в которой состоит пользователь
-            for record in records:
-                if str(user_id) == str(record.get("user_id")):
-                    family_id = record.get("family_id")
-                    break
-            
-            if family_id:
-                # Получаем лист семьи
-                family_sheet = get_family_sheet(f"family-{family_id}")
-                if family_sheet:
-                    records = family_sheet.get_all_records()
-                    monthly_expenses = [record for record in records if record["Дата"].startswith(current_month)]
-                    
-                    for record in monthly_expenses:
-                        category = record["Категория"]
-                        amount = float(record["Сумма"])
-                        stats[category] = stats.get(category, 0) + amount
-                        total += amount
-        
-        # Формируем сообщение со статистикой
-        if stats:
-            stats_message = f"📊 Статистика ({stats_type}) за текущий месяц ({current_month}):\n"
-            for category, sum_amount in stats.items():
-                stats_message += f"{category}: {sum_amount:.2f} руб.\n"
-            stats_message += f"\n💵 Общая сумма: {total:.2f} руб."
+        if period == "week":
+            start_date = today - timedelta(days=today.weekday())
+            end_date = start_date + timedelta(days=6)
+            period_title = f"неделю ({start_date:%d.%m} - {end_date:%d.%m})"
         else:
-            stats_message = f"📊 Нет данных ({stats_type}) за текущий месяц ({current_month})."
-        
-        # Отправляем сообщение без форматирования Markdown
-        await query.message.answer(stats_message, reply_markup=get_main_menu(), parse_mode=None)
+            start_date = today.replace(day=1)
+            end_date = (start_date + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            period_title = f"месяц ({start_date:%m.%Y})"
+
+        # Получаем статистику
+        #print(user_id,stats_type,start_date,end_date)
+        stats = await calculate_stats(
+            user_id=user_id,
+            stats_type=stats_type,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+        # Формируем сообщение
+        message = f"📊 *Статистика за {period_title}*\n\n"
+        for category, amount in stats.items():
+            message += f"{category}: {amount:.2f} руб.\n"
+        message += f"\n💵 *Итого:* {sum(stats.values()):.2f} руб."
+
+        await query.message.answer(message, parse_mode="Markdown")
     
     except Exception as e:
-        logger.error(f"Ошибка при расчете статистики: {e}")
-        await query.message.answer("❌ Произошла ошибка при расчете статистики. Пожалуйста, попробуйте позже.", reply_markup=get_main_menu())
-    
+        logger.error(f"Ошибка статистики: {e}")
+        await query.answer("❌ Не удалось сформировать отчет")
+
+    await state.clear()
     await query.answer()
 
 # Обновленная функция для получения последних трат
