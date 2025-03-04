@@ -836,7 +836,7 @@ async def show_user_budgets(query: CallbackQuery):
     
     #print(user_budgets)
     if not user_budgets:
-        await message.answer("У вас нет установленных бюджетов")
+        await query.message.answer("У вас нет установленных бюджетов")
         return
     
     text = "Ваши текущие бюджеты:\n\n"

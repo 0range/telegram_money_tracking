@@ -1,0 +1,5 @@
+pytest==7.4.0
+pytest-asyncio==0.21.1
+requests-mock==1.11.0
+aiogram==3.0.0b7
+gspread==5.11.3
