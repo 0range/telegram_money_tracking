@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.filters import StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -80,27 +81,28 @@ class EditExpense(StatesGroup):
 class StatsPeriod(StatesGroup):
     WAITING_PERIOD = State()
 
+# Добавляем класс бюджетов
+class BudgetStates(StatesGroup):
+    SELECT_CATEGORY = State()
+    ENTER_AMOUNT = State()
+
 # Главное меню
 def get_main_menu():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Записать расход")],
             [KeyboardButton(text="Посмотреть статистику")],
-            [KeyboardButton(text="Последние траты")],  # Новая кнопка
-            [KeyboardButton(text="Создать семью"), KeyboardButton(text="Вступить в семью")]
+            [KeyboardButton(text="Последние траты")],  # Новая кнопка -- управление последними тратами
+            [KeyboardButton(text="Создать семью"), KeyboardButton(text="Вступить в семью")],
+            [KeyboardButton(text="Управление бюджетами")]  # Новая кнопка -- управление бюджетами
         ],
         resize_keyboard=True  # Клавиатура подстраивается под размер экрана
     )
     return keyboard
 
-# Лист со списком семей
-def setup_families_list():
-    try:
-        return spreadsheet.worksheet("families_list")
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title="families_list", rows=100, cols=3)
-        worksheet.append_row(["family_id", "user_id", "role"])
-        return worksheet
+###
+### Раздел с определением клавиатур для разных кейсов
+###
 
 # Inline-клавиатура с категориями
 def get_categories_keyboard():
@@ -193,6 +195,10 @@ def escape_markdown(text):
     escape_chars = r"\_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
+###
+### Раздел с определением листов в гугл доке
+###
+
 def get_user_sheet(user_id):
     try:
         sheet = spreadsheet.worksheet(str(user_id))
@@ -205,6 +211,15 @@ def get_user_sheet(user_id):
         sheet.append_row(["ID", "Дата", "Категория", "Сумма", "Теги", "Тип", "Комментарий"])
         return sheet
 
+# Лист со списком семей
+def setup_families_list():
+    try:
+        return spreadsheet.worksheet("families_list")
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title="families_list", rows=100, cols=3)
+        worksheet.append_row(["family_id", "user_id", "role"])
+        return worksheet
+
 def get_family_sheet(family_id):
     try:
         sheet = spreadsheet.worksheet(family_id)
@@ -213,6 +228,14 @@ def get_family_sheet(family_id):
         return sheet
     except gspread.WorksheetNotFound:
         return None
+
+def get_budgets_sheet():
+    try:
+        return spreadsheet.worksheet("budgets")
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title="budgets", rows=100, cols=3)
+        worksheet.append_row(["user_id", "category", "budget"])
+        return worksheet
 
 def generate_family_id():
     # Генерация случайного идентификатора семьи (6 символов)
@@ -300,14 +323,91 @@ async def handle_family_id(message: Message):
     await message.reply("Вы успешно вступили в семью! 🎉")
 
 @dp.message(lambda message: message.text == "Записать расход")
-async def start_add_expense(message: Message):
+async def start_add_expense(message: Message, state: FSMContext):
+    await state.clear()  # Очищаем все состояния
+    user_data[user_id] = {}  # Сбрасываем временные данные
     await message.reply(
         "Выберите категорию:",
         reply_markup=get_categories_keyboard()
     )
 
-@dp.callback_query(lambda query: query.data in CATEGORIES)
+# Обработчики для бюджетов
+@dp.message(lambda message: message.text == "Управление бюджетами")
+async def budget_management(message: Message):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Установить бюджет", callback_data="set_budget")],
+            [InlineKeyboardButton(text="Мои бюджеты", callback_data="show_budgets")]
+        ]
+    )
+    await message.answer("Управление бюджетами:", reply_markup=keyboard)
+
+# Обработчики для бюджетов -- установка
+@dp.callback_query(lambda query: query.data in ["set_budget", "show_budgets"])
+async def handle_budget_actions(query: CallbackQuery, state: FSMContext):
+    if query.data == "set_budget":
+        await query.message.answer("Выберите категорию:", reply_markup=get_categories_keyboard())
+        await state.set_state(BudgetStates.SELECT_CATEGORY)
+    else:
+        await show_user_budgets(query)
+    await query.answer()
+
+# Обработчики для бюджетов -- выбор категории
+@dp.callback_query(BudgetStates.SELECT_CATEGORY, lambda query: query.data in CATEGORIES)
+async def select_budget_category(query: CallbackQuery, state: FSMContext):
+    logger.info(f"[БЮДЖЕТ] Начинается выбор категории бюджета")
+    await state.update_data(category=query.data)
+    await query.message.answer(
+        "Введите сумму месячного бюджета:", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_budget")]]
+        )
+    )
+    await state.set_state(BudgetStates.ENTER_AMOUNT)
+    await query.answer()
+
+@dp.callback_query(BudgetStates.ENTER_AMOUNT, lambda query: query.data == "cancel_budget")
+async def cancel_budget(query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await query.message.answer("❌ Установка бюджета отменена")
+    await query.answer()
+
+# Обработчики для бюджетов
+@dp.message(
+    BudgetStates.ENTER_AMOUNT,
+    lambda message: message.text.replace('.', '', 1).isdigit()
+)
+async def save_budget(message: Message, state: FSMContext):
+    logger.info(f"[БЮДЖЕТ] Обработка для пользователя {message.from_user.id}")
+    user_id = message.from_user.id
+    
+    # Добавляем проверку наличия данных в state
+    data = await state.get_data()
+    if 'category' not in data:
+        await message.answer("❌ Ошибка: категория не выбрана")
+        await state.clear()
+        return
+
+    budgets_sheet = get_budgets_sheet()
+    records = budgets_sheet.get_all_records()
+    
+    # Удаляем старый бюджет для категории
+    for idx, record in enumerate(records):
+        if str(record["user_id"]) == str(user_id) and record["category"] == data["category"]:
+            budgets_sheet.delete_rows(idx + 2)  # +2 из-за заголовка и нумерации с 1
+    
+    # Добавляем новый бюджет
+    budgets_sheet.append_row([str(user_id), data["category"], float(message.text)])
+    
+    await message.answer(f"Бюджет для {data['category']} установлен: {message.text} руб/мес")
+    await state.clear()
+
+@dp.callback_query(
+    lambda query: query.data in CATEGORIES,
+    ~StateFilter(BudgetStates.SELECT_CATEGORY)
+)
 async def handle_category(query: CallbackQuery):
+    logger.info(f"[ТРАТА] Начинается выбор категории траты")
     # Сохраняем выбранную категорию в словаре user_data
     user_id = query.from_user.id
     category = query.data
@@ -326,9 +426,20 @@ async def handle_category(query: CallbackQuery):
     # Подтверждаем обработку callback
     await query.answer()
 
-@dp.message(lambda message: message.text.replace('.', '').isdigit())
+@dp.message(
+    lambda message: message.text.replace('.', '', 1).isdigit(),
+    ~StateFilter(BudgetStates.ENTER_AMOUNT),
+    ~StateFilter(StatsPeriod.WAITING_PERIOD)  # Исключаем другие состояния
+)
 async def handle_amount(message: Message):
+    logger.info(f"[ТРАТА] Обработка для пользователя {message.from_user.id}")
     user_id = message.from_user.id
+
+    # Явная проверка, что процесс записи траты начат корректно
+    if user_id not in user_data or 'category' not in user_data[user_id]:
+        await message.answer("⚠️ Сначала выберите категорию через меню 'Записать расход'")
+        return
+
     amount = float(message.text)
     
     # Сохраняем сумму в временных данных пользователя
@@ -445,7 +556,14 @@ async def show_stats_menu(message: Message):
 # Общая функция расчета статистики
 async def calculate_stats(user_id: int, stats_type: str, start_date: datetime.date, end_date: datetime.date):
     stats = defaultdict(float)
-    
+    budgets = {}
+
+    # Получаем бюджеты пользователя
+    budgets_sheet = get_budgets_sheet()
+    for record in budgets_sheet.get_all_records():
+        if str(record["user_id"]) == str(user_id):
+            budgets[record["category"]] = float(record["budget"])
+
     # Личные траты
     if stats_type in ["stats_personal", "stats_all"]:
         personal_sheet = get_user_sheet(user_id)
@@ -467,7 +585,10 @@ async def calculate_stats(user_id: int, stats_type: str, start_date: datetime.da
                     if start_date <= record_date <= end_date:
                         stats[record["Категория"]] += float(record["Сумма"])
     
-    return stats
+    return {
+        "stats": stats,
+        "budgets": budgets
+    }
 
 # Обработчик выбора типа статистики
 @dp.callback_query(lambda query: query.data in ["stats_personal", "stats_family", "stats_all"])
@@ -503,17 +624,27 @@ async def handle_stats_period(query: CallbackQuery, state: FSMContext):
 
         # Получаем статистику
         #print(user_id,stats_type,start_date,end_date)
-        stats = await calculate_stats(
+        stats_data = await calculate_stats(
             user_id=user_id,
             stats_type=stats_type,
             start_date=start_date,
             end_date=end_date
         )
+        stats = stats_data["stats"]
+        budgets = stats_data["budgets"]
 
         # Формируем сообщение
         message = f"📊 *Статистика за {period_title}*\n\n"
         for category, amount in stats.items():
-            message += f"{category}: {amount:.2f} руб.\n"
+            budget = budgets.get(category, 0)
+            if budget > 0:
+                if period == "week":
+                    budget = budget / 4
+                percent = (amount / budget) * 100 if budget != 0 else 0
+                message += f"{category}: {amount:.2f} / {budget:.2f} руб. ({percent:.0f}%)\n"
+            else:
+                message += f"{category}: {amount:.2f} руб.\n"
+
         message += f"\n💵 *Итого:* {sum(stats.values()):.2f} руб."
 
         await query.message.answer(message, parse_mode="Markdown")
@@ -685,6 +816,34 @@ async def handle_new_value(message: Message, state: FSMContext):
         await message.answer("❌ Не удалось обновить трату")
     
     await state.clear()
+
+async def show_user_budgets(query: CallbackQuery):
+    #logger.info(f"Показываем бюджеты пользователя")
+    user_id = query.from_user.id
+    budgets_sheet = get_budgets_sheet()
+    records = budgets_sheet.get_all_records()
+    
+    logger.info(f"Показываем бюджеты. Пользователь {user_id}")
+    #print(records)
+    
+    user_budgets = []
+    for r in records:
+        #print(r)
+        #print(user_id)
+        if str(r["user_id"]) == str(user_id):
+            user_budgets.append(r)
+    
+    #print(user_budgets)
+    if not user_budgets:
+        await message.answer("У вас нет установленных бюджетов")
+        return
+    
+    text = "Ваши текущие бюджеты:\n\n"
+    for budget in user_budgets:
+        text += f"{budget['category']}: {budget['budget']} руб/мес\n"
+    
+    await query.message.answer(text)
+    await query.answer()
 
 @dp.message()
 async def handle_unknown(message: Message):
