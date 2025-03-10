@@ -1,12 +1,17 @@
 from unittest.mock import MagicMock, patch
-from bot import get_user_sheet, get_budgets_sheet
+import gspread
+from bot import get_user_sheet
 
 @patch('gspread.authorize')
 def test_sheet_creation(mock_auth):
     mock_spreadsheet = MagicMock()
-    mock_auth.return_value.open_by_url().worksheet.side_effect = Exception("Not found")
+    mock_auth.return_value.open_by_url.return_value = mock_spreadsheet
     
-    sheet = get_user_sheet(123)
-    mock_auth.return_value.open_by_url().add_worksheet.assert_called_once_with(
+    # Эмулируем отсутствие листа
+    mock_spreadsheet.worksheet.side_effect = gspread.WorksheetNotFound
+    
+    get_user_sheet(123)
+    
+    mock_spreadsheet.add_worksheet.assert_called_once_with(
         title="123", rows=100, cols=11
     )
